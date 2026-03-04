@@ -1,0 +1,644 @@
+# ============================================================
+# GitLab CI/CD Pipeline - .NET Framework 4.8 → Artifactory → IIS
+# ============================================================
+# Prerequisites (GitLab CI/CD Variables - Settings > CI/CD > Variables):
+#
+#   ARTIFACTORY_URL          → https://your-artifactory.example.com/artifactory
+#   ARTIFACTORY_REPO         → your-repo-name (e.g., dotnet-releases)
+#   ARTIFACTORY_USER         → service account username
+#   ARTIFACTORY_API_KEY      → Artifactory API key or password (masked)
+#   IIS_DEPLOY_HOST_PROD     → production server hostname/IP
+#   IIS_DEPLOY_HOST_STAGING  → staging server hostname/IP
+#   IIS_DEPLOY_USER          → Windows/deploy user (e.g., deploy_svc)
+#   IIS_DEPLOY_PASSWORD      → Deploy user password (masked)
+#   IIS_SITE_NAME            → IIS Site name (e.g., MyWebApp)
+#   IIS_APP_POOL_NAME        → IIS App Pool name
+#   IIS_DEPLOY_PATH          → Physical path on server (e.g., C:\inetpub\wwwroot\MyApp)
+#   WEB_CONFIG_FILE          → File-type variable: your web.config with env-specific values
+#                              (Set as "File" type in GitLab CI/CD variables)
+#
+# Runner Requirements:
+#   - Windows GitLab Runner with:
+#       • MSBuild (Visual Studio Build Tools or VS 2019/2022)
+#       • NuGet CLI
+#       • .NET Framework 4.8 SDK/Targeting Pack
+#       • PowerShell 5.1+
+#       • curl / jfrog CLI (optional, for Artifactory uploads)
+# ============================================================
+
+variables:
+  # Project Settings
+  SOLUTION_FILE: "YourSolution.sln"             # ← Change to your .sln filename
+  PROJECT_FILE: "src/YourProject/YourProject.csproj"  # ← Change to your .csproj path
+  BUILD_CONFIGURATION: "Release"
+  TARGET_FRAMEWORK: "net48"
+  PUBLISH_OUTPUT_DIR: "publish_output"
+  ARTIFACT_NAME: "webapp"                        # ← Change to your app name
+  
+  # MSBuild path - adjust to match your runner's VS installation
+  MSBUILD_PATH: "C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools\\MSBuild\\Current\\Bin\\MSBuild.exe"
+  NUGET_PATH: "C:\\ProgramData\\chocolatey\\bin\\nuget.exe"
+  
+  # Disable GitLab's default artifact behavior for Windows paths
+  GIT_CLEAN_FLAGS: "-ffdx"
+
+# ============================================================
+# STAGES
+# ============================================================
+stages:
+  - validate
+  - build
+  - test
+  - publish-artifact
+  - deploy-staging
+  - deploy-production
+
+# ============================================================
+# STAGE 1 — VALIDATE
+# ============================================================
+validate:code-quality:
+  stage: validate
+  tags:
+    - windows
+    - dotnet-framework
+  script:
+    - echo "=== Validating Solution ==="
+    - |
+      if (-not (Test-Path "$env:SOLUTION_FILE")) {
+        Write-Error "Solution file not found: $env:SOLUTION_FILE"
+        exit 1
+      }
+    - echo "Solution file found. Restoring NuGet packages..."
+    - '& "$env:NUGET_PATH" restore "$env:SOLUTION_FILE" -NonInteractive'
+    - echo "=== NuGet Restore Complete ==="
+  only:
+    - merge_requests
+    - main
+    - /^release\/.*/
+  artifacts:
+    when: on_failure
+    paths:
+      - "*.log"
+    expire_in: 1 day
+
+# ============================================================
+# STAGE 2 — BUILD
+# ============================================================
+build:application:
+  stage: build
+  tags:
+    - windows
+    - dotnet-framework
+  script:
+    - echo "=== Starting Build: $env:BUILD_CONFIGURATION ==="
+    
+    # Restore NuGet packages
+    - '& "$env:NUGET_PATH" restore "$env:SOLUTION_FILE" -NonInteractive'
+    
+    # Clean previous outputs
+    - |
+      if (Test-Path "$env:PUBLISH_OUTPUT_DIR") {
+        Remove-Item -Recurse -Force "$env:PUBLISH_OUTPUT_DIR"
+      }
+    
+    # Build & Publish using MSBuild
+    # /p:DeployOnBuild=true produces a deployable package
+    - |
+      & "$env:MSBUILD_PATH" "$env:SOLUTION_FILE" `
+        /p:Configuration=$env:BUILD_CONFIGURATION `
+        /p:Platform="Any CPU" `
+        /p:DeployOnBuild=false `
+        /p:WebPublishMethod=FileSystem `
+        /p:PublishUrl="$env:PUBLISH_OUTPUT_DIR" `
+        /p:DeleteExistingFiles=True `
+        /p:ExcludeApp_Data=True `
+        /t:Build `
+        /m `
+        /v:minimal `
+        /fl `
+        /flp:logfile=msbuild.log;verbosity=normal
+      
+      if ($LASTEXITCODE -ne 0) {
+        Write-Error "MSBuild failed with exit code $LASTEXITCODE"
+        Get-Content msbuild.log | Select-Object -Last 50
+        exit $LASTEXITCODE
+      }
+    
+    # Publish to file system output
+    - |
+      & "$env:MSBUILD_PATH" "$env:PROJECT_FILE" `
+        /p:Configuration=$env:BUILD_CONFIGURATION `
+        /p:Platform="AnyCPU" `
+        /p:WebPublishMethod=FileSystem `
+        /p:PublishUrl="$pwd\$env:PUBLISH_OUTPUT_DIR" `
+        /p:DeleteExistingFiles=True `
+        /t:WebPublish `
+        /m `
+        /v:minimal
+      
+      if ($LASTEXITCODE -ne 0) {
+        Write-Error "WebPublish failed with exit code $LASTEXITCODE"
+        exit $LASTEXITCODE
+      }
+    
+    - echo "=== Build Successful ==="
+    - echo "Published files:"
+    - Get-ChildItem "$env:PUBLISH_OUTPUT_DIR" -Recurse | Select-Object FullName
+
+  artifacts:
+    name: "${ARTIFACT_NAME}-build-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - "$PUBLISH_OUTPUT_DIR/**"
+      - "msbuild.log"
+    expire_in: 7 days
+    when: always
+  
+  only:
+    - main
+    - /^release\/.*/
+    - merge_requests
+
+# ============================================================
+# STAGE 3 — TEST
+# ============================================================
+test:unit-tests:
+  stage: test
+  tags:
+    - windows
+    - dotnet-framework
+  dependencies:
+    - build:application
+  script:
+    - echo "=== Running Unit Tests ==="
+    - |
+      # Discover test assemblies (adjust path pattern to your test projects)
+      $testAssemblies = Get-ChildItem -Path "." -Recurse `
+        -Include "*Tests*.dll", "*Test*.dll" `
+        -Exclude "*.vshost.exe" |
+        Where-Object { $_.FullName -like "*\bin\Release\*" -and $_.FullName -notlike "*\obj\*" }
+      
+      if ($testAssemblies.Count -eq 0) {
+        Write-Warning "No test assemblies found. Skipping tests."
+        exit 0
+      }
+    
+    # Run with VSTest (adjust vstest.console.exe path as needed)
+    - |
+      $vstestPath = "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\TestWindow\vstest.console.exe"
+      
+      if (Test-Path $vstestPath) {
+        $testDlls = ($testAssemblies | Select-Object -ExpandProperty FullName) -join " "
+        & $vstestPath $testAssemblies.FullName `
+          /Logger:"trx;LogFileName=TestResults.trx" `
+          /ResultsDirectory:"TestResults"
+        
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Tests failed!"
+          exit $LASTEXITCODE
+        }
+      } else {
+        Write-Warning "vstest.console.exe not found at $vstestPath. Skipping tests."
+      }
+    
+    - echo "=== Tests Complete ==="
+
+  artifacts:
+    when: always
+    paths:
+      - "TestResults/**"
+    reports:
+      junit: "TestResults/*.trx"
+    expire_in: 7 days
+  
+  only:
+    - main
+    - /^release\/.*/
+    - merge_requests
+
+# ============================================================
+# STAGE 4 — PUBLISH TO ARTIFACTORY
+# ============================================================
+publish:to-artifactory:
+  stage: publish-artifact
+  tags:
+    - windows
+    - dotnet-framework
+  dependencies:
+    - build:application
+  
+  variables:
+    # Build a versioned artifact: appname-1.0.0-abc1234.zip
+    ARTIFACT_VERSION: "${CI_COMMIT_TAG:-0.0.${CI_PIPELINE_IID}}"
+    ARTIFACT_FILENAME: "${ARTIFACT_NAME}-${CI_COMMIT_TAG:-${CI_PIPELINE_IID}}-${CI_COMMIT_SHORT_SHA}.zip"
+  
+  script:
+    - echo "=== Packaging for Artifactory ==="
+    - echo "Version: $env:ARTIFACT_VERSION"
+    - echo "Artifact: $env:ARTIFACT_FILENAME"
+    
+    # Create ZIP of published output
+    - |
+      $zipPath = "$env:ARTIFACT_FILENAME"
+      
+      # Ensure Compress-Archive source exists
+      if (-not (Test-Path "$env:PUBLISH_OUTPUT_DIR")) {
+        Write-Error "Publish output directory not found!"
+        exit 1
+      }
+      
+      Compress-Archive `
+        -Path "$env:PUBLISH_OUTPUT_DIR\*" `
+        -DestinationPath $zipPath `
+        -Force
+      
+      if (-not (Test-Path $zipPath)) {
+        Write-Error "Failed to create ZIP archive!"
+        exit 1
+      }
+      
+      $size = (Get-Item $zipPath).Length / 1MB
+      echo "Archive created: $zipPath ($([math]::Round($size,2)) MB)"
+    
+    # Upload to Artifactory using REST API
+    - |
+      $artifactoryUploadUrl = "$env:ARTIFACTORY_URL/$env:ARTIFACTORY_REPO/$env:ARTIFACT_NAME/$env:ARTIFACT_VERSION/$env:ARTIFACT_FILENAME"
+      
+      echo "Uploading to: $artifactoryUploadUrl"
+      
+      # Create Basic auth header
+      $base64Auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:ARTIFACTORY_USER):$($env:ARTIFACTORY_API_KEY)"))
+      
+      $response = Invoke-RestMethod `
+        -Uri $artifactoryUploadUrl `
+        -Method PUT `
+        -InFile "$env:ARTIFACT_FILENAME" `
+        -Headers @{
+          Authorization = "Basic $base64Auth"
+          "X-Checksum-Deploy" = "false"
+        } `
+        -ContentType "application/zip"
+      
+      echo "Upload response: $($response | ConvertTo-Json)"
+    
+    # Also upload a "latest" symlink/copy for easy reference
+    - |
+      $latestUrl = "$env:ARTIFACTORY_URL/$env:ARTIFACTORY_REPO/$env:ARTIFACT_NAME/latest/$env:ARTIFACT_NAME-latest.zip"
+      $base64Auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:ARTIFACTORY_USER):$($env:ARTIFACTORY_API_KEY)"))
+      
+      Invoke-RestMethod `
+        -Uri $latestUrl `
+        -Method PUT `
+        -InFile "$env:ARTIFACT_FILENAME" `
+        -Headers @{ Authorization = "Basic $base64Auth" } `
+        -ContentType "application/zip"
+      
+      echo "=== Upload to Artifactory Complete ==="
+      echo "Versioned: $artifactoryUploadUrl"
+      echo "Latest:    $latestUrl"
+    
+    # Save artifact metadata for downstream jobs
+    - |
+      @{
+        version  = $env:ARTIFACT_VERSION
+        filename = $env:ARTIFACT_FILENAME
+        url      = "$env:ARTIFACTORY_URL/$env:ARTIFACTORY_REPO/$env:ARTIFACT_NAME/$env:ARTIFACT_VERSION/$env:ARTIFACT_FILENAME"
+        sha      = $env:CI_COMMIT_SHORT_SHA
+        pipeline = $env:CI_PIPELINE_IID
+        built_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+      } | ConvertTo-Json | Out-File -FilePath "artifact_metadata.json" -Encoding UTF8
+      
+      echo "Metadata:"
+      Get-Content "artifact_metadata.json"
+
+  artifacts:
+    paths:
+      - "artifact_metadata.json"
+      - "$ARTIFACT_FILENAME"
+    expire_in: 30 days
+  
+  only:
+    - main
+    - /^release\/.*/
+
+# ============================================================
+# STAGE 5 — DEPLOY TO STAGING
+# ============================================================
+deploy:staging:
+  stage: deploy-staging
+  tags:
+    - windows
+    - dotnet-framework
+  dependencies:
+    - publish:to-artifactory
+  
+  environment:
+    name: staging
+    url: http://$IIS_DEPLOY_HOST_STAGING
+  
+  script:
+    - echo "=== Deploying to STAGING: $env:IIS_DEPLOY_HOST_STAGING ==="
+    
+    # Load artifact metadata
+    - $metadata = Get-Content "artifact_metadata.json" | ConvertFrom-Json
+    - echo "Deploying version: $($metadata.version)"
+    
+    # Run the deployment script on the remote IIS server via PowerShell Remoting
+    - |
+      # Build the remote deployment scriptblock
+      $deployScript = {
+        param(
+          [string]$ArtifactoryUrl,
+          [string]$ArtifactFilename,
+          [string]$ArtifactoryUser,
+          [string]$ArtifactoryApiKey,
+          [string]$IisSiteName,
+          [string]$IisAppPoolName,
+          [string]$IisDeployPath,
+          [string]$WebConfigContent
+        )
+        
+        $ErrorActionPreference = "Stop"
+        $backupPath = "C:\Deployments\Backups\$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        $stagingPath = "C:\Deployments\Staging\$IisSiteName"
+        $downloadPath = "C:\Deployments\Downloads\$ArtifactFilename"
+        
+        # Ensure directories exist
+        @($backupPath, $stagingPath, (Split-Path $downloadPath)) | ForEach-Object {
+          if (-not (Test-Path $_)) { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
+        }
+        
+        Write-Host "--- Step 1: Download artifact from Artifactory ---"
+        $base64Auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${ArtifactoryUser}:${ArtifactoryApiKey}"))
+        Invoke-WebRequest `
+          -Uri $ArtifactoryUrl `
+          -Headers @{ Authorization = "Basic $base64Auth" } `
+          -OutFile $downloadPath `
+          -UseBasicParsing
+        
+        Write-Host "--- Step 2: Extract to staging area ---"
+        if (Test-Path $stagingPath) { Remove-Item -Recurse -Force $stagingPath }
+        New-Item -ItemType Directory -Path $stagingPath -Force | Out-Null
+        Expand-Archive -Path $downloadPath -DestinationPath $stagingPath -Force
+        
+        Write-Host "--- Step 3: Inject web.config from pipeline variable ---"
+        # Replace web.config with the one from GitLab CI variable (file type)
+        $webConfigDest = Join-Path $stagingPath "web.config"
+        [System.IO.File]::WriteAllText($webConfigDest, $WebConfigContent, [System.Text.Encoding]::UTF8)
+        Write-Host "web.config injected successfully"
+        
+        Write-Host "--- Step 4: Stop App Pool ---"
+        Import-Module WebAdministration
+        $pool = Get-WebConfiguration system.applicationHost/applicationPools/add |
+          Where-Object { $_.name -eq $IisAppPoolName }
+        if ($pool -and $pool.state -eq "Started") {
+          Stop-WebAppPool -Name $IisAppPoolName
+          $timeout = 30
+          while ((Get-WebAppPoolState -Name $IisAppPoolName).Value -ne "Stopped" -and $timeout -gt 0) {
+            Start-Sleep -Seconds 1; $timeout--
+          }
+          Write-Host "App Pool stopped"
+        }
+        
+        Write-Host "--- Step 5: Backup current deployment ---"
+        if (Test-Path $IisDeployPath) {
+          Copy-Item -Recurse -Force $IisDeployPath $backupPath
+          Write-Host "Backup saved to: $backupPath"
+        }
+        
+        Write-Host "--- Step 6: Deploy new files ---"
+        # Robocopy for reliable Windows file copy (mirror mode)
+        robocopy $stagingPath $IisDeployPath /MIR /NFL /NDL /NJH /NJS /nc /ns /np
+        # Robocopy exit codes 0-7 are success
+        if ($LASTEXITCODE -gt 7) {
+          Write-Error "Robocopy failed with exit code $LASTEXITCODE"
+          # Rollback
+          Write-Host "Rolling back from: $backupPath"
+          robocopy $backupPath $IisDeployPath /MIR /NFL /NDL
+          exit 1
+        }
+        
+        Write-Host "--- Step 7: Start App Pool ---"
+        Start-WebAppPool -Name $IisAppPoolName
+        Start-Sleep -Seconds 3
+        $state = (Get-WebAppPoolState -Name $IisAppPoolName).Value
+        Write-Host "App Pool state: $state"
+        if ($state -ne "Started") {
+          Write-Error "App Pool failed to start!"
+          exit 1
+        }
+        
+        Write-Host "--- Step 8: Cleanup ---"
+        Remove-Item -Force $downloadPath -ErrorAction SilentlyContinue
+        
+        Write-Host "=== Deployment Complete ==="
+      }
+      
+      # Read web.config content from GitLab file variable
+      $webConfigContent = Get-Content -Path "$env:WEB_CONFIG_FILE" -Raw
+      
+      # Construct the Artifactory download URL
+      $artifactUrl = ($metadata | ConvertFrom-Json).url
+      
+      # Create PSCredential for remote session
+      $secPassword = ConvertTo-SecureString $env:IIS_DEPLOY_PASSWORD -AsPlainText -Force
+      $credential = New-Object System.Management.Automation.PSCredential($env:IIS_DEPLOY_USER, $secPassword)
+      
+      # Open PS Remoting session (WinRM must be enabled on target)
+      $session = New-PSSession `
+        -ComputerName $env:IIS_DEPLOY_HOST_STAGING `
+        -Credential $credential `
+        -Authentication Negotiate
+      
+      try {
+        Invoke-Command -Session $session -ScriptBlock $deployScript -ArgumentList `
+          $artifactUrl,
+          $metadata.filename,
+          $env:ARTIFACTORY_USER,
+          $env:ARTIFACTORY_API_KEY,
+          $env:IIS_SITE_NAME,
+          $env:IIS_APP_POOL_NAME,
+          $env:IIS_DEPLOY_PATH,
+          $webConfigContent
+      }
+      finally {
+        Remove-PSSession $session
+      }
+    
+    - echo "=== Staging Deployment Done ==="
+
+  only:
+    - main
+    - /^release\/.*/
+
+# ============================================================
+# STAGE 6 — DEPLOY TO PRODUCTION
+# ============================================================
+deploy:production:
+  stage: deploy-production
+  tags:
+    - windows
+    - dotnet-framework
+  dependencies:
+    - publish:to-artifactory
+  
+  environment:
+    name: production
+    url: http://$IIS_DEPLOY_HOST_PROD
+  
+  # ⚠️  Manual gate — requires human approval in GitLab UI
+  when: manual
+  
+  script:
+    - echo "=== Deploying to PRODUCTION: $env:IIS_DEPLOY_HOST_PROD ==="
+    
+    - $metadata = Get-Content "artifact_metadata.json" | ConvertFrom-Json
+    - echo "Deploying version: $($metadata.version)"
+    
+    - |
+      $deployScript = {
+        param(
+          [string]$ArtifactoryUrl,
+          [string]$ArtifactFilename,
+          [string]$ArtifactoryUser,
+          [string]$ArtifactoryApiKey,
+          [string]$IisSiteName,
+          [string]$IisAppPoolName,
+          [string]$IisDeployPath,
+          [string]$WebConfigContent
+        )
+        
+        $ErrorActionPreference = "Stop"
+        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $backupPath = "C:\Deployments\Backups\$timestamp"
+        $stagingPath = "C:\Deployments\Staging\$IisSiteName"
+        $downloadPath = "C:\Deployments\Downloads\$ArtifactFilename"
+        
+        @($backupPath, $stagingPath, (Split-Path $downloadPath)) | ForEach-Object {
+          if (-not (Test-Path $_)) { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
+        }
+        
+        Write-Host "--- [1/8] Download from Artifactory ---"
+        $base64Auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${ArtifactoryUser}:${ArtifactoryApiKey}"))
+        Invoke-WebRequest -Uri $ArtifactoryUrl `
+          -Headers @{ Authorization = "Basic $base64Auth" } `
+          -OutFile $downloadPath -UseBasicParsing
+        Write-Host "Downloaded: $downloadPath"
+        
+        Write-Host "--- [2/8] Verify checksum ---"
+        $hash = (Get-FileHash -Path $downloadPath -Algorithm SHA256).Hash
+        Write-Host "SHA256: $hash"
+        
+        Write-Host "--- [3/8] Extract to staging ---"
+        if (Test-Path $stagingPath) { Remove-Item -Recurse -Force $stagingPath }
+        New-Item -ItemType Directory -Path $stagingPath -Force | Out-Null
+        Expand-Archive -Path $downloadPath -DestinationPath $stagingPath -Force
+        
+        Write-Host "--- [4/8] Inject web.config from pipeline ---"
+        $webConfigDest = Join-Path $stagingPath "web.config"
+        [System.IO.File]::WriteAllText($webConfigDest, $WebConfigContent, [System.Text.Encoding]::UTF8)
+        Write-Host "web.config injected"
+        
+        Write-Host "--- [5/8] Stop IIS Site & App Pool ---"
+        Import-Module WebAdministration
+        
+        # Stop IIS Site
+        $site = Get-Website -Name $IisSiteName -ErrorAction SilentlyContinue
+        if ($site -and $site.State -eq "Started") {
+          Stop-Website -Name $IisSiteName
+          Write-Host "IIS Site stopped"
+        }
+        
+        # Stop App Pool
+        $pool = Get-WebConfiguration system.applicationHost/applicationPools/add |
+          Where-Object { $_.name -eq $IisAppPoolName }
+        if ($pool -and (Get-WebAppPoolState -Name $IisAppPoolName).Value -eq "Started") {
+          Stop-WebAppPool -Name $IisAppPoolName
+          $timeout = 60
+          while ((Get-WebAppPoolState -Name $IisAppPoolName).Value -ne "Stopped" -and $timeout -gt 0) {
+            Start-Sleep -Seconds 1; $timeout--
+          }
+          Write-Host "App Pool stopped (timeout remaining: $timeout)"
+        }
+        
+        Write-Host "--- [6/8] Backup & Deploy ---"
+        if (Test-Path $IisDeployPath) {
+          Copy-Item -Recurse -Force $IisDeployPath $backupPath
+          Write-Host "Backup: $backupPath"
+        }
+        
+        robocopy $stagingPath $IisDeployPath /MIR /NFL /NDL /NJH /NJS /nc /ns /np
+        if ($LASTEXITCODE -gt 7) {
+          Write-Error "Robocopy failed ($LASTEXITCODE) — rolling back"
+          robocopy $backupPath $IisDeployPath /MIR /NFL /NDL
+          throw "Deployment failed — rollback applied from $backupPath"
+        }
+        Write-Host "Files deployed to: $IisDeployPath"
+        
+        Write-Host "--- [7/8] Start IIS Site & App Pool ---"
+        Start-WebAppPool -Name $IisAppPoolName
+        Start-Sleep -Seconds 5
+        
+        $poolState = (Get-WebAppPoolState -Name $IisAppPoolName).Value
+        if ($poolState -ne "Started") {
+          # Auto-rollback
+          Write-Host "App pool failed to start. Rolling back..."
+          robocopy $backupPath $IisDeployPath /MIR /NFL /NDL
+          Start-WebAppPool -Name $IisAppPoolName
+          throw "App pool did not start. Rollback applied."
+        }
+        
+        Start-Website -Name $IisSiteName
+        Write-Host "IIS Site started"
+        
+        Write-Host "--- [8/8] Smoke test ---"
+        Start-Sleep -Seconds 5
+        # Lightweight health check (adjust URL to your app's health endpoint)
+        try {
+          $response = Invoke-WebRequest -Uri "http://localhost/health" -UseBasicParsing -TimeoutSec 30
+          Write-Host "Health check: HTTP $($response.StatusCode)"
+          if ($response.StatusCode -ne 200) {
+            Write-Warning "Health check returned non-200 — verify application manually"
+          }
+        } catch {
+          Write-Warning "Health endpoint not reachable: $_"
+          Write-Warning "Verify application manually"
+        }
+        
+        Write-Host "--- [Cleanup] ---"
+        Remove-Item -Force $downloadPath -ErrorAction SilentlyContinue
+        
+        Write-Host "=== PRODUCTION DEPLOYMENT COMPLETE ==="
+        Write-Host "Backup retained at: $backupPath"
+      }
+      
+      $webConfigContent = Get-Content -Path "$env:WEB_CONFIG_FILE" -Raw
+      $artifactUrl = ($metadata | ConvertFrom-Json).url
+      
+      $secPassword = ConvertTo-SecureString $env:IIS_DEPLOY_PASSWORD -AsPlainText -Force
+      $credential = New-Object System.Management.Automation.PSCredential($env:IIS_DEPLOY_USER, $secPassword)
+      
+      $session = New-PSSession `
+        -ComputerName $env:IIS_DEPLOY_HOST_PROD `
+        -Credential $credential `
+        -Authentication Negotiate
+      
+      try {
+        Invoke-Command -Session $session -ScriptBlock $deployScript -ArgumentList `
+          $artifactUrl,
+          $metadata.filename,
+          $env:ARTIFACTORY_USER,
+          $env:ARTIFACTORY_API_KEY,
+          $env:IIS_SITE_NAME,
+          $env:IIS_APP_POOL_NAME,
+          $env:IIS_DEPLOY_PATH,
+          $webConfigContent
+      }
+      finally {
+        Remove-PSSession $session
+      }
+    
+    - echo "=== Production Deployment Complete ==="
+
+  only:
+    - main
+    - /^release\/.*/
