@@ -1,0 +1,113 @@
+stages:
+  - prepare
+  - deploy_dev
+  - deploy_qa
+  - deploy_prod
+
+default:
+  interruptible: true
+
+# ---------------------------------------
+# PREPARE: download artifact, extract, replace web.config
+# ---------------------------------------
+prepare_package:
+  stage: prepare
+  tags: ["windows"]     # Windows runner recommended
+  script:
+    - powershell -NoProfile -ExecutionPolicy Bypass -File deploy\prepare-package.ps1
+  artifacts:
+    expire_in: 7 days
+    paths:
+      - work\payload\        # extracted + modified payload (ready to deploy)
+      - work\meta\           # metadata/logs
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+# ---------------------------------------
+# DEPLOY TEMPLATE (per host)
+# ---------------------------------------
+.deploy_iis_template:
+  tags: ["windows"]
+  needs: ["prepare_package"]
+  script:
+    - powershell -NoProfile -ExecutionPolicy Bypass -File deploy\deploy-iis.ps1
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - deploy_logs\
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# ---------------------------------------
+# DEV - parallel per host
+# ---------------------------------------
+deploy_dev:
+  stage: deploy_dev
+  extends: .deploy_iis_template
+  parallel:
+    matrix:
+      - HOST: "dev-iis-01"
+      - HOST: "dev-iis-02"
+  variables:
+    ENV_NAME: "dev"
+  environment:
+    name: dev
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\/.+$/'
+
+# ---------------------------------------
+# QA - parallel per host
+# ---------------------------------------
+deploy_qa:
+  stage: deploy_qa
+  extends: .deploy_iis_template
+  parallel:
+    matrix:
+      - HOST: "qa-iis-01"
+      - HOST: "qa-iis-02"
+  variables:
+    ENV_NAME: "qa"
+  environment:
+    name: qa
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
+# ---------------------------------------
+# PROD - Canary first, then fanout (manual, from tag)
+# ---------------------------------------
+deploy_prod_canary:
+  stage: deploy_prod
+  extends: .deploy_iis_template
+  variables:
+    ENV_NAME: "prod"
+    HOST: "prod-iis-01"
+  environment:
+    name: production
+  when: manual
+  allow_failure: false
+  resource_group: "prod-iis-deploy"
+  rules:
+    - if: '$CI_COMMIT_TAG'
+
+deploy_prod_fanout:
+  stage: deploy_prod
+  extends: .deploy_iis_template
+  needs: ["prepare_package", "deploy_prod_canary"]
+  parallel:
+    matrix:
+      - HOST: "prod-iis-02"
+      - HOST: "prod-iis-03"
+  variables:
+    ENV_NAME: "prod"
+  environment:
+    name: production
+  when: manual
+  allow_failure: false
+  resource_group: "prod-iis-deploy"
+  rules:
+    - if: '$CI_COMMIT_TAG'
